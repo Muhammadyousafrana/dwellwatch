@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DwellWatch | Vehicle Dwell Monitor</title>
+<meta name="description" content="Real-time vehicle dwell-time monitoring dashboard using AI-powered zone detection.">
+<style>
+body{font-family:system-ui;margin:0;background:#111;color:#eee}
+header,main{padding:12px 16px}
+main{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+img,video{width:100%;background:#000;border-radius:6px}
+label{margin-right:12px}
+input,select,button{background:#222;color:#eee;border:1px solid #444;padding:4px 8px;border-radius:4px}
+input[type=number]{width:60px}
+#status{font-size:20px;font-weight:600}
+.alert{color:#ff4d4d}
+table{width:100%;border-collapse:collapse}
+td,th{border-bottom:1px solid #333;padding:2px 6px;text-align:left}
+</style>
+</head>
+<body>
+<header>
+ <button id="cam">Webcam</button> <input type="file" id="file" accept="video/*">
+ <label>Dwell s <input id="thr" type="number" value="5" min="1"></label>
+ <label>Cooldown s <input id="cd" type="number" value="5" min="1"></label>
+ <label>FPS <select id="fps"><option>2</option><option selected>3</option><option>5</option></select></label>
+ <button id="go">Start</button><button id="stop">Stop</button>
+</header>
+<main>
+ <div><video id="v" muted playsinline></video><canvas id="c" hidden></canvas></div>
+ <div><img id="out" alt="annotated output">
+  <div id="status">idle</div><div id="meta"></div>
+  <table><thead><tr><th>Class</th><th>Track</th><th>Dwell s</th></tr></thead><tbody id="rows"></tbody></table>
+ </div>
+</main>
+<script>
+// BUG FIX: escape user-supplied strings before injecting into innerHTML to prevent XSS
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+const $=id=>document.getElementById(id), v=$('v'), c=$('c'), ctx=c.getContext('2d');
+let running=false, n=0, sid='s'+Date.now();
+
+$('cam').onclick=async()=>{
+  try {
+    v.srcObject=await navigator.mediaDevices.getUserMedia({video:true});
+    v.play();
+  } catch(e) { $('status').textContent='Camera access denied: '+e.message; }
+};
+
+$('file').onchange=e=>{v.srcObject=null;v.src=URL.createObjectURL(e.target.files[0]);v.loop=true;v.play();};
+
+// BUG FIX: reset frame counter and session ID on every Start; prevent double-start
+$('go').onclick=()=>{
+  if(running) return;
+  // BUG FIX: check videoWidth after a short delay to allow video metadata to load,
+  // rather than blocking start silently when video isn't ready yet
+  if(!v.videoWidth && !v.srcObject) {
+    $('status').textContent='Load a webcam or video file first.';
+    return;
+  }
+  running=true; n=0; sid='s'+Date.now(); tick();
+};
+
+$('stop').onclick=()=>{ running=false; $('status').textContent='Stopped.'; };
+
+async function tick(){
+  if(!running) return;
+  // Skip frame if video hasn't loaded dimensions yet (e.g. buffering)
+  if(!v.videoWidth){ setTimeout(tick,200); return; }
+  const w=Math.min(v.videoWidth,960);
+  c.width=w;
+  c.height=Math.round(v.videoHeight*w/v.videoWidth);
+  ctx.drawImage(v,0,0,c.width,c.height);
+  const fps=+$('fps').value;
+  try{
+    const r=await fetch('/api/frame',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({image:c.toDataURL('image/jpeg',.8),stream_id:sid,frame_number:n++,fps,
+        threshold:+$('thr').value,cooldown:+$('cd').value})});
+    const j=await r.json();
+    if(!r.ok) throw new Error((j.error||'Error')+': '+(j.detail||r.status));
+    if(j.annotated_image) $('out').src='data:image/jpeg;base64,'+j.annotated_image;
+    $('status').textContent=j.alert_status;
+    $('status').className=j.violations?'alert':'';
+    // BUG FIX: "slack error" label was wrong; show neutral "slack status" instead
+    const slackStatus = j.slack_notification_status == null ? 'n/a' : String(j.slack_notification_status);
+    $('meta').textContent=`vehicles ${j.total_vehicles} | violations ${j.violations} | slack status: ${slackStatus}`;
+    // BUG FIX: use esc() to sanitise all server-supplied strings before innerHTML injection
+    $('rows').innerHTML=j.vehicles.map(x=>`<tr><td>${esc(x.class)}</td><td>${esc(x.tracker_id)}</td><td>${(x.time_in_zone??0).toFixed(1)}</td></tr>`).join('');
+  }catch(e){
+    $('status').textContent='Error: '+e.message;
+    running=false;
+    return;
+  }
+  setTimeout(tick,1000/fps);
+}
+</script>
+</body>
+</html>
